@@ -1,0 +1,515 @@
+---
+title: "Limma Functional Analysis - Colon"
+output: pdf_document
+author: Adapted from Zakhar Krekhno
+---
+
+
+```{r}
+library(limma)
+library(readxl)
+library(EnhancedVolcano)
+library(phyloseq)
+library(tidyverse)
+library(edgeR)
+theme_set(theme_classic(base_size = 18))
+
+# Load phyloseq objects
+psf = readRDS('Data Files/phyloseq_feces.rds')
+psi = readRDS('Data Files/phyloseq_ileum.rds')
+psj = readRDS('Data Files/phyloseq_jejunum.rds')
+
+# Add timepoint and tissue data
+psi@sam_data$Timing = 'Sac';psj@sam_data$Timing = 'Sac'
+psi@sam_data$tissue = 'Ileum';psj@sam_data$tissue='Jejunum';psf@sam_data$tissue='Colon'
+
+# Load picrust data
+pcf = read.csv("../Haggai/Data Files/PICRUSt2/pathway-table.csv",check.names = F) %>% 
+column_to_rownames("OTU ID") %>% select(-c("Neg-control-1","Neg-control-2","NTC-1"))
+pcj = read.csv("../Haggai/Data Files/PICRUSt2 Jejunum/pathway-table.csv",check.names = F) %>% 
+column_to_rownames("OTU ID")
+pci = read.csv("../Haggai/Data Files/PICRUSt2 Ileum/pathway-table.csv",check.names = F) %>% 
+column_to_rownames("OTU ID")
+
+# Combine
+ps = list(Colon = list(psf,pcf), Ileum = list(psi,pci), Jejunum = list(psj,pcj))
+```
+
+# Part 1: Run Limma
+
+```{r Process Data}
+ps2 = ps %>% lapply(function(x){
+  # x=list(psf,pcf)
+  df1 = x[[1]]; df2 = x[[2]]
+  df1@otu_table = otu_table(df2 %>% as.matrix(), taxa_are_rows = T)
+  t = df2 %>% mutate(df2_term = rownames(df2),temp = rownames(df2)) %>% select(df2_term,temp)
+  o = df2
+  s = df1@sam_data %>% as.matrix() %>% as.data.frame()
+  
+  df1 = phyloseq(otu_table(as.matrix(o),taxa_are_rows = T),tax_table(as.matrix(t)),sample_data(s))
+  df1 = df1 %>% subset_samples(Group != 'TPN_day_2' & Timing == 'Sac')
+  
+  # Reload sample data after filtration
+  s = df1@sam_data %>% as.matrix() %>% as.data.frame()
+  o = df1@otu_table %>% as.matrix() %>% as.data.frame()
+  
+  # Copy Nature paper: https://www.nature.com/articles/s41467-022-28034-z
+  # Claculate normalization factors
+  
+  DGE_LIST <- DGEList(o)
+  ### Reference sample will be the sample with the highest read depth
+  DGE_LIST_Norm <- calcNormFactors(DGE_LIST, method="TMM")
+  
+  #Prep design matrix
+  design_filt <- model.matrix(~TPN_control, data = s)
+  voomvoom <- voom(DGE_LIST_Norm, design_filt, plot=F)
+  
+  fit <- lmFit(voomvoom,design_filt)
+  fit <- eBayes(fit)
+  res <- topTable(fit, coef=2, n=nrow(DGE_LIST_Norm), sort.by="P")
+  res.filt = res %>% c
+  
+  # Calculate plot dataframe
+  mds_plot <- plotMDS(voomvoom,col=as.numeric(s$TPN_control), 
+                    gene.selection = "common",
+                    main = "PCA plot")
+  mds_df <- data.frame(x = mds_plot$x, y = mds_plot$y, sample_id = rownames(mds_plot$distance.matrix.squared)) %>% 
+    left_join(s %>% rownames_to_column('sample_id'))
+  return(list(results=res,results_sig=res.filt,plotdata=mds_df))
+})
+
+# normalize values the way Voom does, include all sac samples
+voomlist = ps %>% lapply(function(x){
+  # x=list(psf,pcf)
+  df1 = x[[1]]; df2 = x[[2]]
+  df1@otu_table = otu_table(df2 %>% as.matrix(), taxa_are_rows = T)
+  t = df2 %>% mutate(df2_term = rownames(df2),temp = rownames(df2)) %>% select(df2_term,temp)
+  o = df2
+  s = df1@sam_data %>% as.matrix() %>% as.data.frame()
+  
+  df1 = phyloseq(otu_table(as.matrix(o),taxa_are_rows = T),tax_table(as.matrix(t)),sample_data(s))
+  df1 = df1 %>% subset_samples(Timing == 'Sac')
+  
+  # Reload sample data after filtration
+  s = df1@sam_data %>% as.matrix() %>% as.data.frame()
+  o = df1@otu_table %>% as.matrix() %>% as.data.frame()
+  
+  # Copy Nature paper: https://www.nature.com/articles/s41467-022-28034-z
+  # Claculate normalization factors
+  
+  DGE_LIST <- DGEList(o)
+  ### Reference sample will be the sample with the highest read depth
+  DGE_LIST_Norm <- calcNormFactors(DGE_LIST, method="TMM")
+  
+  #Prep design matrix
+  design_filt <- model.matrix(~TPN_control, data = s)
+  voomvoom <- voom(DGE_LIST_Norm, design_filt, plot=F)
+  v = voomvoom$E %>% t %>% as.data.frame() %>% rownames_to_column('X.SampleID') %>% 
+    pivot_longer(cols = -X.SampleID, names_to = 'pwy', values_to = 'abundance') %>% 
+    left_join(s)
+  
+  return(v)
+})
+```
+
+
+```{r save stats, warning=FALSE}
+key =read.csv('C:/Users/armetcal/OneDrive - UBC/Grad School/Data/HUMAN COHORT/PD Functional Analysis/Reference Files/pwy_key.csv')
+
+ps4 = lapply(ps2,function(x){
+  # x=ps2[[1]]
+  # Add descriptions
+  res = x$results %>% rownames_to_column('PWY') %>% left_join(key) %>% 
+    mutate(`Superpathway?` = str_detect(desc,'[Ss]uperpathway'))
+  return(list(results = res))
+})
+
+results = list(Colon = ps4$Colon$results,
+               Ileum = ps4$Ileum$results,
+               Jejunum = ps4$Jejunum$results)
+
+writexl::write_xlsx(results,"Statistics/6. Limma MetaCyc Statistics.xlsx")
+```
+
+```{r Venn diagram of Limma results}
+require(VennDiagram)
+require(RColorBrewer)
+
+res_filt = results %>% lapply(function(x) x %>% filter(abs(logFC)>2,adj.P.Val<0.001,!is.na(desc)))
+res_filt$Colon$tissue = 'Colon'
+res_filt$Ileum$tissue = 'Ileum'
+res_filt$Jejunum$tissue = 'Jejunum'
+res_filt = res_filt %>% lapply(function(x) x %>% pull(desc))
+
+  
+myCol <- brewer.pal(3, "Dark2")
+filename = 'Figures/Fig 5 - Limma Venn Diagram'
+venn.diagram(
+    x = res_filt,
+    category.names = c("Colon" , "Ileum" , "Jejunum"),
+    filename = paste(filename,'.png',sep=''),
+    output=T,
+    
+    # Output features
+    imagetype="png" ,
+    height = 480 , 
+    width = 480 , 
+    resolution = 300,
+    compression = "lzw",
+    
+    # Circles
+    lwd = 2,
+    lty = 'blank',
+    fill = myCol,
+    alpha = 0.5,
+    
+    # Numbers
+    cex = .6,
+    fontface = "bold",
+    fontfamily = "sans",
+    
+    # Set names
+    cat.cex = 0.6,
+    cat.fontface = "bold",
+    cat.default.pos = "outer",
+    cat.pos = c(-27, 27, 180),
+    cat.dist = c(0.07, 0.07, 0.055),
+    cat.fontfamily = "sans",
+    rotation = 1
+)
+# Delete the annoying log file
+unlink(paste(filename,'.png.',Sys.Date(),'*.log',sep=''))
+```
+
+# Part 2: Paired Dynamics Between Colon and Ileum
+
+
+```{r Ileal Top Hits}
+# Extract top hits
+sig = ps4$Ileum$results %>% arrange(logFC) %>% 
+  filter(`Superpathway?` == T) %>% 
+  filter(abs(logFC)>4, adj.P.Val<0.00001) %>% 
+  rename(pwy = PWY)
+
+# Resolve multiple representations of similar/identical pathways
+# Glycolysis etc
+sig_rem = sig %>% filter(pwy %in% c('GLYOXYLATE-BYPASS','GLYCOLYSIS-TCA-GLYOX-BYPASS','TCA-GLYOX-BYPASS')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+# Lipid A
+sig_rem = sig %>% filter(str_detect(desc,'Kdo')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+# Ornardeg
+sig_rem = sig %>% filter(parent=='ORNARGDEG-PWY' | pwy == 'ORNARGDEG-PWY') %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+
+# Make names better for plotting
+sig$desc[sig$desc=='superpathway of D-glucarate and D-galactarate degradation'] = 'D-glucarate and\nD-galactarate degradation'
+sig$desc[sig$desc=='superpathway of ubiquinol-8 biosynthesis (early decarboxylation)'] = 'Ubiquinol-8 biosynthesis\n(early decarboxylation)'
+sig$desc[sig$desc=='superpathway of phenylethylamine degradation'] = 'Phenylethylamine degradation'
+sig$desc[sig$desc=='superpathway of glycol metabolism and degradation'] = 'Glycol metabolism\nand degradation'
+sig$desc[sig$desc=='superpathway of heme <i>b</i> biosynthesis from glycine'] = 'Heme biosynthesis\nfrom glycine'
+sig$desc[sig$desc=='superpathway of ornithine degradation'] = 'Ornithine degradation'
+sig$desc[sig$desc=='superpathway of L-threonine metabolism'] = 'L-threonine metabolism'
+sig$desc[sig$desc=='superpathway of L-arginine, putrescine, and 4-aminobutanoate degradation'] = 'L-arginine, putrescine, and\n4-aminobutanoate degradation'
+
+sig$desc[sig$desc=='superpathway of L-arginine and L-ornithine degradation'] = 'L-arginine and\nL-ornithine degradation'
+sig$desc[sig$desc=='superpathway of (Kdo)<SUB>2</SUB>-lipid A biosynthesis'] = '(Kdo)2-lipid A\nbiosynthesis'
+sig$desc[sig$desc=='superpathway of glyoxylate bypass and TCA'] = 'Glyoxylate bypass and TCA'
+sig$desc[sig$desc=='superpathway of chorismate metabolism'] = 'Chorismate metabolism'
+sig$desc[sig$desc=='superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass'] = 'Glycolysis,\npyruvate dehydrogenase,\nTCA, and glyoxylate bypass'
+sig$desc[sig$desc=='superpathway of Kdo<sub>2</sub>-lipid A biosynthesis'] = '(Kdo)2-lipid A\nbiosynthesis'
+sig$desc[sig$desc=='superpathway of L-tryptophan biosynthesis'] = 'L-tryptophan biosynthesis'
+
+# Extract normalized abundance data for the pathways of interest from each tissue
+temp.f = voomlist$Colon %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc) %>% 
+  select(Mouse,tissue,pwy,abundance,Group,TPN_control,Day,desc)
+
+temp.i = voomlist$Ileum %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc) %>% 
+  select(Mouse,tissue,pwy,abundance,Group,TPN_control,Day,desc)
+
+temp.j = voomlist$Jejunum %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc) %>% 
+  select(Mouse,tissue,pwy,abundance,Group,TPN_control,Day,desc)
+
+# Combine all the abundance data
+coab.ileum = rbind(temp.f,temp.i,temp.j) %>% 
+  pivot_wider(names_from = tissue,values_from = abundance) %>% 
+  filter(!is.na(Ileum))
+```
+
+```{r Spearman correlations between segments, include=FALSE}
+# Colon vs Ileum
+coab.ileum.stats = coab.ileum %>% group_by(TPN_control,pwy,desc) %>% 
+  group_modify(~cor.test(.$Colon,.$Ileum,method='spearman') %>%
+                 .[c('statistic','p.value','estimate')] %>% 
+                 lapply(as.matrix %>% as.data.frame) %>% bind_rows %>% 
+                 t %>% as.data.frame) %>% ungroup() %>% 
+  mutate(Test = 'Ileum vs.\nColon') %>% 
+# Jejunum vs Ileum
+  rbind(coab.ileum %>% group_by(TPN_control,pwy,desc) %>% 
+    group_modify(~cor.test(.$Jejunum,.$Ileum,method='spearman') %>%
+                   .[c('statistic','p.value','estimate')] %>% 
+                   lapply(as.matrix %>% as.data.frame) %>% bind_rows %>% 
+                   t %>% as.data.frame) %>% ungroup() %>% 
+    mutate(Test = 'Ileum vs.\nJejunum')) %>% 
+  `names<-`(c('TPN_control','Pathway','Description','Statistic','P value','rho','Test')) %>% 
+  mutate(Method = 'Spearman',.after = 'Description') %>% 
+  group_by(TPN_control,Test) %>% 
+  # Correct P values, order from most to least significant
+  mutate(`Q value` = p.adjust(`P value`, method = 'fdr')) %>% arrange(`P value`) %>% 
+  ungroup()
+```
+
+## Dot Plot of Rho Values
+
+```{r}
+coab.stats = coab.ileum.stats %>% 
+  select(-Description) %>% unique() %>% 
+  left_join(ps4$Ileum$results %>% select(PWY,desc) %>% rename(Pathway=PWY,Description = desc))
+
+# Adjust descriptions for plotting
+coab.stats$Description[coab.stats$Description=='superpathway of demethylmenaquinol-6 biosynthesis II'] = 'Demethylmenaquinol-6 biosynthesis II'
+# coab.stats$Description[coab.stats$Description=='heparin degradation'] = 'Heparin degradation'
+coab.stats$Description[coab.stats$Description=='superpathway of heme <i>b</i> biosynthesis from glycine'] = 'Heme biosynthesis from glycine'
+# coab.stats$Description[coab.stats$Description=='ketogluconate metabolism'] = 'Ketogluconate metabolism'
+coab.stats$Description[coab.stats$Description=='superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass'] = 'Glycolysis, pyruvate dehydrogenase,\nTCA, and glyoxylate bypass'
+coab.stats$Description[coab.stats$Description=='superpathway of glyoxylate bypass and TCA'] = 'Glyoxylate bypass and TCA'
+coab.stats$Description[coab.stats$Description=='superpathway of glycol metabolism and degradation'] = 'Glycol metabolism and degradation'
+# coab.stats$Description[coab.stats$Description=='glyoxylate cycle'] = 'Glyoxylate cycle'
+
+coab.stats$Description[coab.stats$Description=='superpathway of D-glucarate and D-galactarate degradation'] = 'D-glucarate and\nD-galactarate degradation'
+coab.stats$Description[coab.stats$Description=='superpathway of ubiquinol-8 biosynthesis (early decarboxylation)'] = 'Ubiquinol-8 biosynthesis\n(early decarboxylation)'
+coab.stats$Description[coab.stats$Description=='superpathway of phenylethylamine degradation'] = 'Phenylethylamine degradation'
+coab.stats$Description[coab.stats$Description=='superpathway of ornithine degradation'] = 'Ornithine degradation'
+coab.stats$Description[coab.stats$Description=='superpathway of L-threonine metabolism'] = 'L-threonine metabolism'
+coab.stats$Description[coab.stats$Description=='superpathway of L-arginine, putrescine, and 4-aminobutanoate degradation'] = 'L-arginine, putrescine, and\n4-aminobutanoate degradation'
+
+coab.stats$Description[coab.stats$Description=='superpathway of L-arginine and L-ornithine degradation'] = 'L-arginine and L-ornithine degradation'
+coab.stats$Description[coab.stats$Description=='superpathway of (Kdo)<SUB>2</SUB>-lipid A biosynthesis'] = '(Kdo)2-lipid A biosynthesis'
+coab.stats$Description[coab.stats$Description=='superpathway of chorismate metabolism'] = 'Chorismate metabolism'
+coab.stats$Description[coab.stats$Description=='superpathway of Kdo<sub>2</sub>-lipid A biosynthesis'] = '(Kdo)2-lipid A biosynthesis'
+coab.stats$Description[coab.stats$Description=='superpathway of L-tryptophan biosynthesis'] = 'L-tryptophan biosynthesis'
+```
+
+```{r}
+# Set order
+temp = coab.stats %>% filter(TPN_control == 'TPN',Test=='Ileum vs.\nColon') %>% arrange(rho)
+coab.stats$Description = factor(coab.stats$Description, levels = unique(temp$Description))
+
+coab.stats %>% 
+  rename("Rho" = rho) %>% 
+  mutate(Sig = ifelse(`Q value`>0.05,'',
+                      ifelse(`Q value`>0.01,'*',
+                             ifelse(`Q value`>0.001,'**',
+                                    ifelse(`Q value`<=0.001,'***',''))))) %>% 
+  ggplot(aes(TPN_control,Description,col = Rho)) +
+    geom_point(size =14) +
+    theme_classic(base_size = 18) +
+    scale_color_gradient2(low="darkblue", high="darkred", guide="colorbar") +
+    geom_text(aes(label=Sig),size = 9, col = 'white',nudge_y = -0.2) +
+    ylab(NULL) + xlab(NULL) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap('Test')
+
+ggsave('Figures/Fig 5 - Limma Paired Dynamics - Dot Plot of Top Ileal Hits.png',height = 7.5, width = 7.5)
+```
+
+```{r Save Stats}
+coab.stats2 = coab.stats %>% select(Test,TPN_control,Pathway,Description,everything()) %>% 
+  rename(`Spearman Test` = Test)
+coab.stats2$Description = paste('Superpathway of',coab.stats2$Description,sep=' ')
+
+writexl::write_xlsx(coab.stats2,path = 'Statistics/Fig 5 - Limma Paired Dynamics - Spearman Correlations of Top Ileal Hits.xlsx')
+```
+
+# Part 3: Longitudinal Analysis
+
+```{r Colon}
+# Top hits
+sig = ps4$Colon$results %>% 
+  filter(`Superpathway?` == T) %>%
+  filter(abs(logFC)>2, adj.P.Val<1e-4) %>% 
+  rename(pwy = PWY) %>% arrange(logFC)
+
+# Resolve multiple representations of similar/identical pathways
+sig_gly = sig %>% filter(pwy %in% c('GLYOXYLATE-BYPASS','GLYCOLYSIS-TCA-GLYOX-BYPASS','TCA-GLYOX-BYPASS')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_gly$pwy))
+
+# Make labels nice
+sig$desc[sig$desc=='superpathway of demethylmenaquinol-6 biosynthesis II'] = 'Demethylmenaquinol-6\nbiosynthesis II'
+sig$desc[sig$desc=='heparin degradation'] = 'Heparin degradation'
+sig$desc[sig$desc=='superpathway of heme <i>b</i> biosynthesis from glycine'] = 'Heme biosynthesis from glycine'
+sig$desc[sig$desc=='ketogluconate metabolism'] = 'Ketogluconate metabolism'
+sig$desc[sig$desc=='superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass'] = 'Glycolysis, pyruvate dehydrogenase,\nTCA, and glyoxylate bypass'
+sig$desc[sig$desc=='superpathway of glyoxylate bypass and TCA'] = 'Glyoxylate bypass and TCA'
+sig$desc[sig$desc=='superpathway of glycol metabolism and degradation'] = 'Glycol metabolism and degradation'
+sig$desc[sig$desc=='glyoxylate cycle'] = 'Glyoxylate cycle'
+# Save ordering (by fold change)
+sig$desc = factor(sig$desc, levels =sig$desc)
+
+# Normalized abundance data
+temp = voomlist[[1]] %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc)
+# Break into treatment and control groups.
+# Note that the baseline samples are shared between both groups. Since no measurements are paired (i.e. 1 datapoint = 1 mouse), using a shared baseline is the most sensible option.
+TPN = temp %>% filter(!str_detect(Group, 'SAL'))
+SAL = temp %>% filter(!str_detect(Group, 'TPN'))
+
+# Plot the longitudinal data. Note that only the sac data points are used so that all mice are represented equally
+p.colon = temp %>% 
+  mutate(TPN_control = ifelse(Group=='Baseline','Baseline',TPN_control)) %>%
+  mutate(colour = ifelse(TPN_control == 'Baseline','black',ifelse(TPN_control=='TPN','seagreen3','red2'))) %>% 
+  ggplot(aes(Day,abundance, col = colour, fill = colour)) +
+  geom_jitter(height = 0, width = 0.1) +
+  geom_smooth(inherit.aes = F, data = TPN, mapping = aes(Day,abundance), col = 'seagreen3') +
+  geom_smooth(inherit.aes = F, data = SAL, mapping = aes(Day,abundance), col = 'red2') +
+  scale_fill_identity() +
+  ggeasy::easy_center_title() +
+  scale_color_identity() +
+  theme_minimal(base_size = 16) + 
+  xlab('Day of Sacrifice') + ylab(NULL) + ggtitle('Colon') +
+  facet_wrap('desc', ncol = 1,strip.position='left',dir='v', scales='free_y') + 
+  theme(strip.text.y.left = element_text(angle = 0,hjust=1)) +
+  theme(axis.ticks.y = element_blank(),axis.text.y = element_blank())
+p.colon
+
+# ggsave('../Final Results/6. Limma Top Results Longitudinal - Colon - q0.0001_FC2.jpeg',height = 6, width = 7)
+```
+
+```{r Ileum}
+sig = ps4$Ileum$results %>% arrange(logFC) %>% 
+  filter(`Superpathway?` == T) %>%
+  filter(abs(logFC)>4, adj.P.Val<1e-5) %>% 
+  rename(pwy = PWY)
+
+# Resolve multiple representations of similar/identical pathways
+# Glycolysis etc
+sig_rem = sig %>% filter(pwy %in% c('GLYOXYLATE-BYPASS','GLYCOLYSIS-TCA-GLYOX-BYPASS','TCA-GLYOX-BYPASS')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+# Lipid A
+sig_rem = sig %>% filter(str_detect(desc,'Kdo')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+# Ornardeg
+sig_rem = sig %>% filter(parent=='ORNARGDEG-pwy' | pwy == 'ORNARGDEG-pwy') %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+
+# Make labels look nice
+sig$desc[sig$desc=='superpathway of D-glucarate and D-galactarate degradation'] = 'D-glucarate and D-galactarate degradation'
+sig$desc[sig$desc=='superpathway of ubiquinol-8 biosynthesis (early decarboxylation)'] = 'Ubiquinol-8 biosynthesis (early decarboxylation)'
+sig$desc[sig$desc=='superpathway of phenylethylamine degradation'] = 'Phenylethylamine degradation'
+sig$desc[sig$desc=='superpathway of glycol metabolism and degradation'] = 'Glycol metabolism and degradation'
+sig$desc[sig$desc=='superpathway of heme <i>b</i> biosynthesis from glycine'] = 'Heme biosynthesis from glycine'
+sig$desc[sig$desc=='superpathway of ornithine degradation'] = 'Ornithine degradation'
+sig$desc[sig$desc=='superpathway of L-threonine metabolism'] = 'L-threonine metabolism'
+sig$desc[sig$desc=='superpathway of L-arginine, putrescine, and 4-aminobutanoate degradation'] = 'L-arginine, putrescine, and\n4-aminobutanoate degradation'
+
+sig$desc[sig$desc=='superpathway of L-arginine and L-ornithine degradation'] = 'L-arginine and L-ornithine degradation'
+sig$desc[sig$desc=='superpathway of (Kdo)<SUB>2</SUB>-lipid A biosynthesis'] = '(Kdo)2-lipid A biosynthesis I'
+sig$desc[sig$desc=='superpathway of glyoxylate bypass and TCA'] = 'Glyoxylate bypass and TCA'
+sig$desc[sig$desc=='superpathway of chorismate metabolism'] = 'Chorismate metabolism'
+sig$desc[sig$desc=='superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass'] = 'Glycolysis, pyruvate dehydrogenase,\nTCA, and glyoxylate bypass'
+sig$desc[sig$desc=='superpathway of Kdo<sub>2</sub>-lipid A biosynthesis'] = '(Kdo)2-lipid A biosynthesis II'
+sig$desc[sig$desc=='superpathway of L-tryptophan biosynthesis'] = 'L-tryptophan biosynthesis'
+# Set order
+sig$desc = factor(sig$desc, levels =sig$desc)
+
+# Normalized abundance data
+temp = voomlist[[2]] %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc)
+# Break into treatment and control groups.
+# Note that the baseline samples are shared between both groups. Since no measurements are paired (i.e. 1 datapoint = 1 mouse), using a shared baseline is the most sensible option.
+TPN = temp %>% filter(!str_detect(Group, 'SAL'))
+SAL = temp %>% filter(!str_detect(Group, 'TPN'))
+
+p.ileum = temp %>% 
+  mutate(TPN_control = ifelse(Group=='Baseline','Baseline',TPN_control)) %>%
+  mutate(colour = ifelse(TPN_control == 'Baseline','black',ifelse(TPN_control=='TPN','seagreen3','red2'))) %>% 
+  ggplot(aes(Day,abundance, col = colour, fill = colour)) +
+  geom_jitter(height = 0, width = 0.1) +
+  geom_smooth(inherit.aes = F, data = TPN, mapping = aes(Day,abundance), col = 'seagreen3') +
+  geom_smooth(inherit.aes = F, data = SAL, mapping = aes(Day,abundance), col = 'red2') +
+  scale_fill_identity() +
+  scale_color_identity() +
+  theme_minimal(base_size = 16) + 
+  xlab('Day of Sacrifice') + ylab(NULL) + ggtitle('Ileum') +
+  ggeasy::easy_center_title() +
+  facet_wrap('desc', ncol = 1,strip.position='left',dir='v', scales='free_y') + 
+  theme(strip.text.y.left = element_text(angle = 0,hjust=1)) +
+  theme(axis.ticks.y = element_blank(),axis.text.y = element_blank())
+p.ileum
+# ggsave('../Final Results/6. Limma Top Results - Ileum - Superpathways_q1e5_FC4.jpeg',height = 11, width = 7)
+```
+
+```{r Jejunum}
+sig = ps4$Jejunum$results %>% arrange(logFC) %>% 
+  filter(`Superpathway?` == T) %>%
+  filter(abs(logFC)>2, adj.P.Val<1e-3) %>% 
+  mutate(colour = ifelse(logFC>0, 'seagreen3','red2')) %>% 
+  rename(pwy = PWY)
+
+# Resolve multiple representations of similar/identical pathways
+# Glycolysis etc
+sig_rem = sig %>% filter(pwy %in% c('GLYOXYLATE-BYPASS','GLYCOLYSIS-TCA-GLYOX-BYPASS','TCA-GLYOX-BYPASS')) %>% 
+  filter(P.Value != min(.$P.Value))# Select most significant result
+sig = sig %>% filter(!(pwy %in% sig_rem$pwy))
+
+sig$desc[sig$desc=='superpathway of L-methionine biosynthesis (by sulfhydrylation)'] = 'L-methionine biosynthesis\n(by sulfhydrylation)'
+sig$desc[sig$desc=='superpathway of <i>Clostridium acetobutylicum</i> acidogenic fermentation'] = 'Clostridium acetobutylicum\nacidogenic fermentation'
+sig$desc[sig$desc=='superpathway of glycolysis, pyruvate dehydrogenase, TCA, and glyoxylate bypass'] = 'Glycolysis, pyruvate dehydrogenase,\nTCA, and glyoxylate bypass'
+sig$desc[sig$desc=='superpathway of glyoxylate bypass and TCA'] = 'Glyoxylate bypass and TCA'
+sig$desc[sig$desc=='superpathway of ubiquinol-8 biosynthesis (early decarboxylation)'] = 'Ubiquinol-8 biosynthesis\n(early decarboxylation)'
+sig$desc[sig$desc=='superpathway of chorismate metabolism'] = 'Chorismate metabolism'
+
+sig$desc = factor(sig$desc, levels =sig$desc)
+
+temp = voomlist[[3]] %>% 
+  filter(pwy %in% sig$pwy) %>% 
+  left_join(sig) %>% 
+  mutate(Day = as.integer(Day)) %>% arrange(desc)
+TPN = temp %>% filter(!str_detect(Group, 'SAL'))
+SAL = temp %>% filter(!str_detect(Group, 'TPN'))
+
+p.jejunum = temp %>% 
+  mutate(TPN_control = ifelse(Group=='Baseline','Baseline',TPN_control)) %>%
+  mutate(colour = ifelse(TPN_control == 'Baseline','black',ifelse(TPN_control=='TPN','seagreen3','red2'))) %>% 
+  ggplot(aes(Day,abundance, col = colour, fill = colour)) +
+  geom_jitter(height = 0, width = 0.1) +
+  geom_smooth(inherit.aes = F, data = TPN, mapping = aes(Day,abundance), col = 'seagreen3') +
+  geom_smooth(inherit.aes = F, data = SAL, mapping = aes(Day,abundance), col = 'red2') +
+  scale_fill_identity() +
+  scale_color_identity() +
+  theme_minimal(base_size = 16) + 
+  xlab('Day of Sacrifice') + ylab(NULL) + ggtitle('Jejunum') +
+  ggeasy::easy_center_title() +
+  facet_wrap('desc', ncol = 1,strip.position='left',dir='v', scales='free_y') + 
+  theme(strip.text.y.left = element_text(angle = 0,hjust=1)) +
+  theme(axis.ticks.y = element_blank(),axis.text.y = element_blank())
+
+# ggsave('../Final Results/6. Limma Top Results - Jejunum - Superpathways_q0.001_FC2.jpeg',height = 4, width = 7)
+```
+
+```{r}
+p1 = ggpubr::ggarrange(p.colon,p.jejunum + theme(plot.margin = margin(9,9,70,9, "pt")),ncol=1,nrow=2,heights = c(4.5,5.5),align='v')
+p2 = ggpubr::ggarrange(p1,p.ileum,ncol=2,nrow=1)
+ggsave('Figures/Fig S2 - Longitudinal Superpathways.jpeg',p2,height=12, width=15)
+```
+

@@ -1,0 +1,146 @@
+---
+title: "Fig. 2 - Alpha Diversity and Boxplots"
+author: "Avril Metcalfe-Roach"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(vegan)
+library(phyloseq)
+library(tidyverse)
+library(data.table)
+library(sjPlot)
+
+# Load datasets
+psi = readRDS('Data Files/phyloseq_ileum.rds')
+psj = readRDS('Data Files/phyloseq_jejunum.rds')
+psf = readRDS('Data Files/phyloseq_feces.rds') %>% subset_samples(Timing=='Sac')
+
+# Change factors to characters so that they can be modified
+psf@sam_data$Groups = as.character(psf@sam_data$Groups)
+psi@sam_data$Groups = as.character(psi@sam_data$Groups)
+psj@sam_data$Groups = as.character(psj@sam_data$Groups)
+
+# Annotate the groups to be more descriptive
+psf@sam_data$Groups[psf@sam_data$Day==0] = 'Baseline'
+psf@sam_data$Groups[psf@sam_data$Day != 0 & psf@sam_data$TPN_control=='Control'] = 'Control'
+psf@sam_data$Groups[psf@sam_data$Groups=='Baseline' | psf@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+psi@sam_data$Groups[psi@sam_data$Groups=='Baseline' | psi@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+psj@sam_data$Groups[psj@sam_data$Groups=='Baseline' | psj@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+```
+
+
+```{r Alpha Diversity}
+# Each dataset is rarefied individually
+ps = list(Ileum = psi, Jejunum = psj, Feces = psf) %>% 
+  lapply(function(x){
+    Rar_table <- rarefy_even_depth(x, sample.size = min(sample_sums(x)), rngseed = 12345)
+    Rar_table@phy_tree <- NULL
+    return(Rar_table)
+  }) 
+
+# Add tissue info
+ps$Ileum@sam_data$Source = 'Ileum'
+ps$Jejunum@sam_data$Source = 'Jejunum'
+ps$Feces@sam_data$Source = 'Colon'
+
+# Combine datasets for easy plotting
+ps = merge_phyloseq(ps$Ileum,ps$Jejunum,ps$Feces)
+
+# Create alpha diversity plots
+p <- plot_richness(ps, "Groups", measures = "Chao1") +
+  theme_classic(base_size = 18) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) 
+# Format Groups variable to make it look nicer
+p$data$Groups = sapply(p$data$Groups,function(x) str_replace_all(x, '_',' ') %>% str_replace_all('day','Day'))
+# Edit plots to make them more presentable
+p = p + geom_boxplot(data = p$data, 
+                     aes(x = Groups, y = value, color = Groups), 
+                     alpha = 0.1) + 
+  xlab(NULL) + ylab('Chao1 Diversity') +
+  ggpubr::stat_compare_means(size = 5, comparisons = list(c('Baseline/\nControl','TPN Day 2'),c('Baseline/\nControl','TPN Day 4'),c('Baseline/\nControl','TPN Day 6'))) +
+  theme(legend.title = element_blank()) +
+  facet_wrap('Source', scales = 'free') +
+  scale_y_continuous(expand = expansion(mult = 0.1)) +
+  scale_color_manual(values=c("salmon4", "palegreen2", "palegreen3", "palegreen4"),
+                     breaks=c("Baseline/\nControl", "TPN Day 2", "TPN Day 4", "TPN Day 6"))
+
+save_plot( 
+  filename = "Figures/Fig 2 - Alpha Diversity.tif",
+  fig = p,
+  width = 25,
+  height = 12,
+  dpi = 300,
+  theme = theme_get(),
+  label.size = 2.4,
+  axis.textsize = 0.8,
+  axis.titlesize = 0.7,
+  legend.textsize = 0.6,
+  legend.titlesize = 0.5,
+  legend.itemsize = 0.5
+)
+```
+
+# Barplots
+
+```{r}
+create_barplot <- function(phyloseq,lvl,seg,output_dir = ''){
+  
+  #Tax_glom and transform to relative abundance:
+  ps_bar <- phyloseq %>% tax_glom(lvl) %>% microbiome::transform('compositional') #%>% correct_taxa()
+  #melts the table to data frame and Change to long format:
+  df <- psmelt(ps_bar) %>% rename('test' = all_of(lvl))
+  top_taxa <- df %>%
+    group_by(test,Group) %>% 
+    summarize(Mean = mean(Abundance),.groups='keep') %>%
+    arrange(-Mean)
+  
+  # Group everything that's less than 1% abundance
+  top <- top_taxa$test[top_taxa$Mean>0.01] %>% unique()
+  df0 <- df %>% mutate(test = fct_other(test, keep=top)) # All other taxa = 'Other'
+  # Select colours for plot
+  colourCount = length(unique(df0$test))
+  mycolors <- colorRampPalette(brewer.pal(colourCount, "Paired"))(colourCount) %>% 
+    suppressWarnings() # Otherwise annoying
+  
+  # Make taxonomic barplot
+  plot = df0 %>% mutate(Day2 = paste('Day',Day,sep=' ')) %>% 
+    ggplot(aes(fct_reorder(Sample, Day2), Abundance, 
+               fill = test, groupName = Day2)) +  
+    scale_fill_manual(values = mycolors) +
+    geom_col(col=NA) +
+    theme(axis.ticks.x = element_blank(), axis.text.x = element_blank()) + 
+    ggtitle(seg) +
+    scale_x_discrete(labels = vars(Sample)) +
+    facet_grid(.~TPN_control + Day2, scales = "free", space = "free_x") +
+    xlab(NULL) +
+    ylab("Relative abundance") +
+    theme(strip.text.x = element_text(size=7.5, face="bold", margin = margin(b = 2, t = 2)))+
+    theme(plot.title = element_text(hjust = 0.5, margin = margin(b = 8, t = 2)))+
+    guides(fill=guide_legend(title=lvl))
+
+    if(colourCount>18){ w = 26 } else {w = 22}
+  
+  save_plot(
+    filename = paste('Figures/Fig 2 - Taxonomic Barplots - ',seg,".tif",sep=''),
+    fig = last_plot(),
+    width = w,
+    height = 9,
+    dpi = 300,
+    theme = theme_get(),
+    label.color = "black",
+    label.size = 1,
+    axis.textsize = 0.7,
+    axis.titlesize = 0.75,
+    legend.textsize = 0.6,
+    legend.titlesize = 0.65,
+    legend.itemsize = 0.3
+  )
+}
+
+create_barplot(psf,lvl='Genus',seg='Colon')
+create_barplot(psi,lvl='Genus',seg='Ileum')
+create_barplot(psj,lvl='Genus',seg='Jejunum')
+```
+

@@ -1,0 +1,226 @@
+---
+title: "Fig. 3 - Taxon Domination and Differential Abundance"
+author: "Avril Metcalfe-Roach"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r}
+library(phyloseq)
+library(microbiome)
+library(tidyverse)
+
+# Datasets
+psi = readRDS('Data Files/phyloseq_ileum.rds') %>% tax_glom('Genus')
+psj = readRDS('Data Files/phyloseq_jejunum.rds') %>% tax_glom('Genus')
+psf = readRDS('Data Files/phyloseq_feces.rds') %>% tax_glom('Genus') %>% 
+  subset_samples(Timing=='Sac')
+
+# Change factors to characters so that they can be modified
+psf@sam_data$Groups = as.character(psf@sam_data$Groups)
+psi@sam_data$Groups = as.character(psi@sam_data$Groups)
+psj@sam_data$Groups = as.character(psj@sam_data$Groups)
+
+# Annotate the groups to be more descriptive
+psf@sam_data$Groups[psf@sam_data$Day==0] = 'Baseline'
+psf@sam_data$Groups[psf@sam_data$Day != 0 & psf@sam_data$TPN_control=='Control'] = 'Control'
+psf@sam_data$Groups[psf@sam_data$Groups=='Baseline' | psf@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+
+psi@sam_data$Groups[psi@sam_data$Groups=='Baseline' | psi@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+psj@sam_data$Groups[psj@sam_data$Groups=='Baseline' | psj@sam_data$Groups=='Control'] = 'Baseline/\nControl'
+```
+
+# Domination
+
+Domination occurs when a single taxon represents x % of the microbiome.
+```{r Calculate dominance}
+dom=tibble()
+for (L in list(psi,psj,psf)){
+
+  # Add tissue info
+  if(identical(L,psi)){tissue = 'Ileum'}
+  if(identical(L,psj)){tissue = 'Jejunum'}
+  if(identical(L,psf)){tissue = 'Colon'}
+  
+  # Remove any failed reads
+  L = prune_samples(sample_sums(L)>0,L)
+    
+  # Calculate dominance and add to data frame
+  temp = dominance(L) %>% select(relative) %>% 
+  mutate(dom40 = relative>=0.4,
+         domsp = dominant(L,level='Genus'),
+         tissue = tissue) %>% 
+  rownames_to_column('X.SampleID') %>% 
+  left_join(L@sam_data %>% as.matrix %>% as.data.frame() %>% select(X.SampleID,TPN_control,Day,Groups))
+  
+  dom = rbind(dom,temp)
+}
+# Clean up
+rm(temp,tissue)
+```
+
+```{r Summary tables - per group/timepoint}
+dom_sum = dom %>%
+  group_by(tissue, Groups, TPN_control, Day) %>% 
+  count(dom40) %>% ungroup() %>% 
+  pivot_wider(names_from = dom40,values_from = n,values_fill = 0) %>% 
+  mutate(total = `TRUE`+`FALSE`,
+         pct_dom = round(100*`TRUE`/(`TRUE`+`FALSE`),1)) %>% 
+  mutate(Groups = sapply(.$Groups,function(x) x %>% str_replace_all('_',' ') %>% str_replace('day','Day'))) %>% 
+  mutate(Day = paste('Day',as.character(.$Day)))
+
+# Group all the control/baselines across all days
+dom_sum = dom_sum %>% 
+  group_by(tissue,Groups) %>% 
+  summarise(`FALSE` = sum(`FALSE`),
+            `TRUE` = sum(`TRUE`),
+            total = sum(total),.groups='keep') %>% 
+  ungroup() %>% 
+  mutate(total = `TRUE`+`FALSE`,
+         pct_dom = round(100*`TRUE`/(`TRUE`+`FALSE`),1))
+```
+
+```{r STATS - Individual TPN Days}
+dom_sum$pval = NA
+
+p=c(NA);temp = dom_sum %>% filter(tissue=='Ileum')
+for(i in 2:nrow(temp)){
+    # i=1
+    p = c(p,fisher.test(temp[c(1,i),c('FALSE','TRUE')])$p.value)
+}
+dom_sum$pval[dom_sum$tissue=='Ileum'] = p
+
+p=c(NA);temp = dom_sum %>% filter(tissue=='Jejunum')
+for(i in 2:nrow(temp)){
+    # i=1
+    p = c(p,fisher.test(temp[c(1,i),c('FALSE','TRUE')])$p.value)
+}
+dom_sum$pval[dom_sum$tissue=='Jejunum'] = p
+
+p=c(NA);temp = dom_sum %>% filter(tissue=='Colon')
+for(i in 2:nrow(temp)){
+    # i=1
+    p = c(p,fisher.test(temp[c(1,i),c('FALSE','TRUE')])$p.value)
+}
+dom_sum$pval[dom_sum$tissue=='Colon'] = p
+
+dom_sum = dom_sum %>% group_by(tissue) %>% mutate(qval = p.adjust(pval,method ='fdr')) %>% ungroup
+```
+
+```{r Plot Dominance}
+# Change qvals to stars
+dom_sum = dom_sum %>% 
+  mutate(symb = ifelse(is.na(qval),'',
+                       ifelse(qval<0.0001,'****',
+                              ifelse(qval<0.001,'***',
+                                     ifelse(qval<0.01,'**',
+                                            ifelse(qval<0.05,'*','ns')))))) %>% 
+  # Add x coord for qval labels
+  mutate(xcoord = ifelse(Groups=='TPN Day 2',2,ifelse(Groups=='TPN Day 4',3,ifelse(Groups=='TPN Day 6',4,NA))))
+
+# Coordinate dataframe
+anno = dom_sum %>% select(tissue,symb,xcoord) %>% 
+  mutate(ycoord=70) %>% 
+  filter(!is.na(xcoord))
+
+dom_sum %>% 
+  ggplot(aes(x=Groups,y=pct_dom, fill=Groups)) +
+  geom_col() +
+  theme_bw(base_size = 18) +
+  xlab(NULL) + ylab('% Samples (40% Dominance)') +
+  theme(axis.text.x  = element_text(angle=90, hjust=1, vjust=0.5),
+        legend.position = 'none') +
+  ylim(0,100) +
+  geom_text(inherit.aes=F, data = anno, aes(x = xcoord,  y = ycoord, label = symb),size=6) +
+  scale_x_discrete(limits = c("Baseline/\nControl",
+                              "TPN Day 2", "TPN Day 4", "TPN Day 6")) + #Order the groups in the facets
+  scale_fill_manual(values=c("salmon4", "palegreen2", "palegreen3", "palegreen4"),
+                         breaks=c('Baseline/\nControl', "TPN Day 2", "TPN Day 4", "TPN Day 6")) +
+  facet_wrap('tissue')
+ggsave('Figures/Fig 3 - Dominance - Genus.png',height = 5, width = 9)
+```
+
+```{r Save Stats}
+write.csv(dom_sum,'Statistics/Fig 3 - Dominance - Genus - Statistics.csv',row.names = F)
+```
+
+# Differential Abundance
+
+We will remove Day 2 TPN to maximize effect size.
+
+```{r Load data and packages}
+# Remove dominance data
+rm(list = objects())
+
+# Load libraries
+library(phyloseq)
+library(ANCOMBC)
+library(ALDEx2)
+library(Maaslin2)
+library(tidyverse)
+library(ggpubr)
+
+# This contains tidy functions for ANCOM-BC, ALDEx2, and MaAsLin2 so that the results are cross-compatible.
+source("da_supplementary_functions.R")
+
+# Load datasets
+psf = suppressMessages(readRDS('Data Files/phyloseq_feces.rds') %>%
+  subset_samples(Timing=='Sac' & Group !='TPN_day_2') %>% tax_glom('Genus'))
+psi = suppressMessages(readRDS('Data Files/phyloseq_ileum.rds') %>%
+  subset_samples(Group !='TPN_day_2') %>% tax_glom('Genus'))
+psj = suppressMessages(readRDS('Data Files/phyloseq_jejunum.rds') %>%
+  subset_samples(Group !='TPN_day_2') %>% tax_glom('Genus'))
+```
+
+```{r Run Tools - Univariate, message=FALSE, include=FALSE}
+da_results = list()
+
+for(ps in list(psf,psj,psi)){
+ps=psf
+  if(identical(ps,psf)) tissue = 'Colon'
+  if(identical(ps,psi)) tissue = 'Ileum'
+  if(identical(ps,psj)) tissue = 'Jejunum'
+  
+  # ANCOM-BC
+  ancom.sp = suppressMessages(tidy_ancombc(phyloseq = ps, formula = "TPN_control", p_adj_method = "fdr",
+                          prv_cut = 0.1, abun_cut=0.001, lib_cut = 0,
+                          group = 'TPN_control', struc_zero = T, neg_lb = F, tax_level = 'Genus'))
+  # ALDEX2
+  aldex.sp = suppressMessages(tidy_aldex2(phyloseq = ps, formula = 'TPN_control',
+                         aldex_type = 'kw', prv_cut = 0.1, abun_cut=0.001))
+  
+  #MAASLIN2
+  maas.sp = suppressMessages(tidy_maaslin(phyloseq=ps,formula='TPN_control',
+                         prv_cut = 0.1,abun_cut = 0.001,
+                         normalization = 'TSS',
+                         transform='AST',analysis_method = 'LM',
+                         max_significance=0.05, standardize=F,
+                         plot_heatmap = F,plot_scatter=F))
+  gc()
+  
+  # Combine the results (Need all three tools, along with DA columns)
+  res = combine_da_results(ancom.sp,aldex.sp,maas.sp)
+  
+  # Add to results list
+  da_results = append(da_results,list(res))
+  names(da_results)[length(da_results)] = tissue
+  
+  # Venn diagram of the significant bugs across the three tools ~~~~~~~~~~
+  # This one is for reference (labeled, but labels are badly placed)
+  da_venn_diagram(res, filename = paste0('Figures/Fig 3 - Venn Diagram of DA genuses - ',tissue))
+  # This one is better for paper
+  da_venn_diagram(res, filename = paste0('Figures/Fig 3 - Venn Diagram of DA genuses - ',tissue,' - no labels'), add_labels = F)
+}
+
+```
+
+```{r}
+writexl::write_xlsx(list(Colon = da_results$Colon$combined_res, Ileum = da_results$Ileum$combined_res, 
+                         Jejunum = da_results$Jejunum$combined_res),
+                    'Statistics/Fig 3 - Differential Abundance - Full Stats.xlsx')
+
+writexl::write_xlsx(list(Colon = da_results$Colon$stat_summary, Ileum = da_results$Ileum$stat_summary, 
+                         Jejunum = da_results$Jejunum$stat_summary),
+                    'Statistics/Fig 3 - Differential Abundance - Stat Summary.xlsx')
+```
+

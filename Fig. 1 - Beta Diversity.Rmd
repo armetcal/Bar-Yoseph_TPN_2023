@@ -1,0 +1,116 @@
+---
+title: "Fig. 1 - Beta Diversity"
+author: "Avril Metcalfe-Roach"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r Make Plots}
+library(sjPlot)
+library(phyloseq)
+library(tidyverse)
+
+# Load all datasets, filter fecal dataset to only include sac samples so that they match other locations
+psi = readRDS('Data Files/phyloseq_ileum.rds')
+psj = readRDS('Data Files/phyloseq_jejunum.rds')
+psf = readRDS('Data Files/phyloseq_feces.rds') %>% subset_samples(Timing=='Sac')
+
+# Change factors to characters so that they can be modified
+psf@sam_data$Groups = as.character(psf@sam_data$Groups)
+psi@sam_data$Groups = as.character(psi@sam_data$Groups)
+psj@sam_data$Groups = as.character(psj@sam_data$Groups)
+
+# Annotate the groups to be more descriptive
+psf@sam_data$Groups[psf@sam_data$Day==0] = 'Baseline'
+psf@sam_data$Groups[psf@sam_data$Day != 0 & psf@sam_data$TPN_control=='Control'] = 'Control'
+
+# Run beta diversity for all 3 datasets
+plots = list()
+for (L in list(psf,psi,psj)){
+  
+  # Annotate which tissue
+  if(identical(L,psi)){tissue = 'Ileum'}
+  if(identical(L,psj)){tissue = 'Jejunum'}
+  if(identical(L,psf)){tissue = 'Colon'}
+
+  # Make the labels nice
+  L@sam_data$Groups = sapply(L@sam_data$Groups,function(x) str_replace(x,'[_ ]day[_ ]',' Day '))
+  
+  # Rarefy to even depth:
+  Rar_table <- rarefy_even_depth(L, sample.size = min(sample_sums(L)), rngseed = 1234) %>% suppressMessages()
+  
+  # Calculate beta diversity
+  PS.ord <- ordinate(Rar_table, method = "PCoA",distance =  "bray")
+  percentVar <- round(100 * PS.ord$values$Relative_eig, digits = 1) 
+  
+  # Plot beta diversity
+  p = plot_ordination(Rar_table, PS.ord, type="samples", color="Groups") +
+    coord_fixed() +
+    ggtitle(tissue) +
+    geom_point(size = 2) +
+    stat_ellipse(geom = "polygon", type="norm", alpha=0.1, aes(fill=Groups)) +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    theme_bw(base_size = 18) +
+    ggeasy::easy_center_title() +
+    theme(legend.title = element_blank())
+    
+  plots <<- append(plots, list(p))
+}
+
+# Combine the three plots
+ggpubr::ggarrange(plotlist = plots, common.legend = T, legend = 'right', ncol = 3, align = 'hv')
+
+save_plot(filename = "Figures/Fig 1 - Beta Diversity.tif",
+         fig = last_plot(),
+         width = 30,
+         height = 12,
+         dpi = 300,
+         theme = theme_get()
+  )
+```
+
+```{r Statistics}
+library(vegan)
+
+stats = list(psf,psi,psj) %>% 
+  lapply(function(x){
+    # Same steps as above
+    if(identical(x,psi)){tissue = 'Ileum'}
+    if(identical(x,psj)){tissue = 'Jejunum'}
+    if(identical(x,psf)){tissue = 'Colon'}
+    x@sam_data$Groups = sapply(x@sam_data$Groups,function(y) str_replace(y,'[_ ]day[_ ]',' Day '))
+    Rar_table <- rarefy_even_depth(x, sample.size = min(sample_sums(x)), rngseed = 1234) %>% suppressMessages()
+    
+    #Across all groups:
+    ps_bray <- phyloseq::distance(Rar_table, method = "bray")
+    p = adonis2(ps_bray ~ sample_data(Rar_table)$TPN_control)$`Pr(>F)`[1]
+    stat_table = tibble(Tissue = tissue, Variable = 'All TPN vs Baseline/Control', Test = 'PERMANOVA', 
+                        Metric = 'Bray-Curtis', Pval = p)
+    
+    # Compare Control with TPN Days:
+    temp = Rar_table %>% subset_samples(Groups %in% c('Control','TPN Day 2'))
+    ps_bray <- phyloseq::distance(temp, method = "bray")
+    p = adonis2(ps_bray ~ sample_data(temp)$TPN_control)$`Pr(>F)`[1]
+    stat_table = stat_table %>% rbind(tibble(Tissue = tissue, Variable = 'Control vs TPN Day 2', Test = 'PERMANOVA', 
+                                             Metric = 'Bray-Curtis', Pval = p))
+    temp = Rar_table %>% subset_samples(Groups %in% c('Control','TPN Day 4'))
+    ps_bray <- phyloseq::distance(temp, method = "bray")
+    p = adonis2(ps_bray ~ sample_data(temp)$TPN_control)$`Pr(>F)`[1]
+    stat_table = stat_table %>% rbind(tibble(Tissue = tissue, Variable = 'Control vs TPN Day 4', Test = 'PERMANOVA', 
+                                             Metric = 'Bray-Curtis', Pval = p))
+    temp = Rar_table %>% subset_samples(Groups %in% c('Control','TPN Day 6'))
+    ps_bray <- phyloseq::distance(temp, method = "bray")
+    p = adonis2(ps_bray ~ sample_data(temp)$TPN_control)$`Pr(>F)`[1]
+    stat_table = stat_table %>% rbind(tibble(Tissue = tissue, Variable = 'Control vs TPN Day 6', Test = 'PERMANOVA', 
+                                             Metric = 'Bray-Curtis', Pval = p))
+    
+    # Correct p values
+    stat_table = stat_table %>% mutate(Qval = p.adjust(Pval,method='fdr') %>% round(4))
+    return(stat_table)
+  }) %>% bind_rows()
+
+
+write.csv(stats, 'Statistics/Fig 1 - Beta Diversity Statistics.csv', row.names=F)
+```
+
